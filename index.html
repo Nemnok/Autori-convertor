@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Autori Convertor — Batch PDF Processor</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+      background: #f0f4f8;
+      color: #2d3748;
+      padding: 24px 16px;
+      min-height: 100vh;
+    }
+
+    .container {
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+
+    h1 {
+      font-size: 1.75rem;
+      color: #1a202c;
+      margin-bottom: 24px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    /* ── Upload card ── */
+    .upload-card {
+      background: #fff;
+      border: 2px dashed #cbd5e0;
+      border-radius: 10px;
+      padding: 32px 24px;
+      text-align: center;
+      margin-bottom: 20px;
+      transition: border-color 0.2s;
+    }
+    .upload-card:focus-within,
+    .upload-card:hover { border-color: #4299e1; }
+
+    .upload-card input[type="file"] {
+      display: block;
+      margin: 0 auto 16px;
+      font-size: 0.95rem;
+      cursor: pointer;
+      max-width: 400px;
+    }
+
+    .upload-label {
+      font-size: 0.9rem;
+      color: #718096;
+      margin-bottom: 16px;
+    }
+
+    /* ── Buttons ── */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 10px 22px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 1rem;
+      font-weight: 600;
+      transition: background 0.2s, opacity 0.2s, transform 0.1s;
+      user-select: none;
+    }
+    .btn:active:not(:disabled) { transform: scale(0.97); }
+    .btn:disabled { opacity: 0.38; cursor: not-allowed; }
+
+    .btn-primary { background: #4299e1; color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: #2b6cb0; }
+
+    .btn-success { background: #48bb78; color: #fff; }
+    .btn-success:hover:not(:disabled) { background: #2f855a; }
+
+    /* ── Hint banner ── */
+    .hint {
+      background: #fffbeb;
+      border-left: 4px solid #f6ad55;
+      padding: 12px 16px;
+      border-radius: 0 6px 6px 0;
+      margin-bottom: 20px;
+      font-size: 0.9rem;
+      color: #744210;
+    }
+
+    /* ── Results card ── */
+    .results-card {
+      background: #fff;
+      border-radius: 10px;
+      padding: 20px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.07);
+    }
+
+    .results-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .results-header h2 { font-size: 1.15rem; }
+
+    /* ── Progress bar ── */
+    .progress-wrap { margin-bottom: 14px; }
+    .progress-bar {
+      height: 8px;
+      background: #e2e8f0;
+      border-radius: 99px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      background: #4299e1;
+      border-radius: 99px;
+      transition: width 0.3s ease;
+      width: 0%;
+    }
+    .progress-label {
+      text-align: center;
+      font-size: 0.82rem;
+      color: #718096;
+      margin-top: 5px;
+    }
+
+    /* ── Results table ── */
+    .table-wrap { overflow-x: auto; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.875rem;
+    }
+    th {
+      background: #edf2f7;
+      padding: 10px 14px;
+      text-align: left;
+      font-weight: 600;
+      border-bottom: 2px solid #cbd5e0;
+      white-space: nowrap;
+    }
+    td {
+      padding: 9px 14px;
+      border-bottom: 1px solid #e2e8f0;
+      vertical-align: top;
+      word-break: break-word;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: #f7fafc; }
+
+    .status-done  { color: #276749; font-weight: 700; }
+    .status-error { color: #c53030; font-weight: 700; }
+    .status-processing { color: #c05621; }
+
+    .diag { font-size: 0.82rem; color: #718096; }
+    .diag.diag-error { color: #c53030; }
+  </style>
+</head>
+<body>
+<div class="container">
+
+  <h1>📄 Autori Convertor</h1>
+
+  <div class="upload-card">
+    <input type="file" id="fileInput" accept=".pdf" multiple>
+    <p class="upload-label">Выберите от 1 до 50 PDF-файлов</p>
+    <button class="btn btn-primary" id="generateBtn" disabled>⚙️ Generate</button>
+  </div>
+
+  <div class="hint" id="hint" style="display:none">
+    ℹ️ Браузер может запросить разрешение на множественные скачивания — пожалуйста, разрешите их.
+  </div>
+
+  <div class="results-card" id="resultsSection" style="display:none">
+    <div class="results-header">
+      <h2>Результаты</h2>
+      <button class="btn btn-success" id="downloadAllBtn" disabled>⬇️ Download all</button>
+    </div>
+
+    <div class="progress-wrap" id="progressWrap" style="display:none">
+      <div class="progress-bar">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+      <div class="progress-label" id="progressLabel">0 / 0</div>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Исходный файл</th>
+            <th>Имя / Фамилия</th>
+            <th>IAE</th>
+            <th>CNAE</th>
+            <th>Статус</th>
+            <th>Диагностика</th>
+          </tr>
+        </thead>
+        <tbody id="resultsBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<!-- PDF.js (UMD build — exposes global `pdfjsLib`) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"
+        integrity="sha384-/1qUCSGwTur9vjf/z9lmu/eCUYbpOTgSjmpbMQZ1/CtX2v/WcAIKqRv+U1DUCG6e"
+        crossorigin="anonymous"></script>
+<script>
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+</script>
+
+<!-- pdf-lib (UMD build — exposes global `PDFLib`) -->
+<script src="https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"
+        integrity="sha384-weMABwrltA6jWR8DDe9Jp5blk+tZQh7ugpCsF3JwSA53WZM9/14PjS5LAJNHNjAI"
+        crossorigin="anonymous"></script>
+
+<!-- Application logic (ES module; can access pdfjsLib + PDFLib globals) -->
+<script type="module" src="app.js"></script>
+</body>
+</html>
