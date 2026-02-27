@@ -51,6 +51,12 @@ const URL_REVOKE_DELAY_MS = 60_000;
 /** Enable verbose dev logging + debug UI when URL contains ?dev */
 const DEV_MODE = new URLSearchParams(window.location.search).has('dev');
 
+/** Scale factor for rendering PDF to canvas for OCR. */
+const OCR_SCALE = 2.0;
+
+/** OCR languages: Spanish + English. */
+const OCR_LANGS = 'spa+eng';
+
 /** Accumulates debug info for the "Copy debug report" button. */
 let _debugReport = [];
 
@@ -405,7 +411,8 @@ function reconstructDates(text) {
  * @returns {Promise<{
  *   fullText: string,
  *   pageItems: Array<{ pageNum: number, items: object[] }>,
- *   pageLines: Array<Array<{ y: number, text: string, items: object[] }>>
+ *   pageLines: Array<Array<{ y: number, text: string, items: object[] }>>,
+ *   pageDims: Array<{ width: number, height: number }>
  * }>}
  */
 async function extractPDFText(arrayBuffer) {
@@ -417,6 +424,7 @@ async function extractPDFText(arrayBuffer) {
   let fullText = '';
   const pageItems = [];
   const pageLines = []; // per-page array of { y, text, items }
+  const pageDims  = []; // per-page { width, height } in PDF points
 
   if (DEV_MODE) {
     devReport(`=== PDF: ${pdf.numPages} page(s) ===`);
@@ -424,6 +432,8 @@ async function extractPDFText(arrayBuffer) {
 
   for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
     const page = await pdf.getPage(pageNum);
+    const viewport = page.getViewport({ scale: 1 });
+    pageDims.push({ width: viewport.width, height: viewport.height });
     const content = await page.getTextContent({ includeMarkedContent: false });
     // Keep only items that have non-empty string content.
     const rawItems = content.items.filter(it => it.str && typeof it.str === 'string' && it.str.trim().length > 0);
@@ -465,7 +475,7 @@ async function extractPDFText(arrayBuffer) {
   }
 
   pdf.destroy();
-  return { fullText, pageItems, pageLines };
+  return { fullText, pageItems, pageLines, pageDims };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -613,7 +623,7 @@ function applyTextOverlay(pdfPage, font, items, newText) {
  * @param {Array<Array<{ y: number, text: string, items: object[] }>>} pageLines
  * @returns {Promise<Uint8Array>}  Bytes of the output PDF.
  */
-async function generateOutputPDF(originalArrayBuffer, pageItems, pageLines) {
+async function generateOutputPDF(originalArrayBuffer, pageItems, pageLines, pageDims) {
   const today = formatDateDDMMYYYY(new Date());
 
   // pdf-lib needs its own copy of the buffer.
@@ -634,8 +644,16 @@ async function generateOutputPDF(originalArrayBuffer, pageItems, pageLines) {
     const { items } = pageItems[pi] || { items: [] };
     const lines = pageLines ? pageLines[pi] : null;
 
+    // Filter items to bottom half of the page only (replacements must not
+    // touch the upper 50 %).  In PDF coordinates y=0 is at the page bottom,
+    // so the visual bottom half has y <= pageHeight / 2.
+    const pageHeight = pageDims && pageDims[pi] ? pageDims[pi].height : null;
+    const bottomItems = pageHeight
+      ? items.filter(it => it.transform[5] <= pageHeight / 2)
+      : items;
+
     // Use the pre-reconstructed lines if available, otherwise rebuild.
-    const lineGroups = groupItemsByLine(items);
+    const lineGroups = groupItemsByLine(bottomItems);
     const lineCount = lineGroups.length;
 
     // ── Track which lines have been handled to avoid double-overlay ───────
@@ -737,6 +755,271 @@ async function generateOutputPDF(originalArrayBuffer, pageItems, pageLines) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 7b. OCR FALLBACK PIPELINE
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Render a single PDF page to a canvas element at the given scale.
+ *
+ * @param {ArrayBuffer} arrayBuffer  Raw PDF bytes.
+ * @param {number}      pageNum      1-based page number.
+ * @param {number}      scale        Render scale factor.
+ * @returns {Promise<HTMLCanvasElement>}
+ */
+async function renderPDFPageToCanvas(arrayBuffer, pageNum, scale) {
+  const data = new Uint8Array(arrayBuffer.slice(0));
+  const pdf  = await pdfjsLib.getDocument({ data }).promise;
+  const page = await pdf.getPage(pageNum);
+  const viewport = page.getViewport({ scale });
+
+  const canvas = document.createElement('canvas');
+  canvas.width  = viewport.width;
+  canvas.height = viewport.height;
+  const ctx = canvas.getContext('2d');
+
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  pdf.destroy();
+  return canvas;
+}
+
+/**
+ * Return a new canvas containing only the bottom half of the source canvas.
+ *
+ * @param {HTMLCanvasElement} sourceCanvas
+ * @returns {HTMLCanvasElement}
+ */
+function cropCanvasBottomHalf(sourceCanvas) {
+  const halfH = Math.floor(sourceCanvas.height / 2);
+  const crop  = document.createElement('canvas');
+  crop.width  = sourceCanvas.width;
+  crop.height = sourceCanvas.height - halfH;
+  const ctx = crop.getContext('2d');
+  ctx.drawImage(
+    sourceCanvas,
+    0, halfH, sourceCanvas.width, crop.height,   // source rect
+    0, 0,     crop.width,         crop.height     // dest rect
+  );
+  return crop;
+}
+
+/**
+ * Run Tesseract.js OCR on a canvas element.
+ *
+ * @param {HTMLCanvasElement} canvas
+ * @param {string}           langs  e.g. 'spa+eng'.
+ * @returns {Promise<object>}  Tesseract recognition data (text, lines, words …).
+ */
+async function runOCROnCanvas(canvas, langs) {
+  if (typeof Tesseract === 'undefined') {
+    throw new Error('Tesseract.js is not loaded — cannot run OCR');
+  }
+  const worker = await Tesseract.createWorker(langs);
+  const { data } = await worker.recognize(canvas);
+  await worker.terminate();
+  return data;
+}
+
+/**
+ * Convert an OCR bbox (pixel coordinates in the cropped bottom-half canvas)
+ * to PDF coordinate space (origin at bottom-left of the full page).
+ *
+ * @param {{ x0: number, y0: number, x1: number, y1: number }} bbox
+ * @param {number} pageHeight  Full page height in PDF points.
+ * @param {number} scale       Canvas render scale factor.
+ * @returns {{ x: number, y: number, width: number, height: number }}
+ */
+function ocrBboxToPDF(bbox, pageHeight, scale) {
+  const halfPageH = pageHeight / 2;
+  return {
+    x:      bbox.x0 / scale,
+    y:      halfPageH - bbox.y1 / scale,  // bottom of bbox → PDF y
+    width:  (bbox.x1 - bbox.x0) / scale,
+    height: (bbox.y1 - bbox.y0) / scale,
+  };
+}
+
+/**
+ * Apply a white-box + text overlay at a PDF position derived from an OCR bbox.
+ *
+ * @param {object} pdfPage      pdf-lib PDFPage.
+ * @param {object} font         Embedded pdf-lib font.
+ * @param {{ x: number, y: number, width: number, height: number }} coords
+ * @param {string} newText      Replacement string.
+ */
+function applyOCROverlay(pdfPage, font, coords, newText) {
+  const fontSize  = Math.max(coords.height * 0.85, 6);
+  const textWidth = font.widthOfTextAtSize(newText, fontSize);
+  const rectW     = Math.max(coords.width, textWidth) + 4;
+  const rectH     = coords.height * 1.45;
+
+  pdfPage.drawRectangle({
+    x:      coords.x - 1,
+    y:      coords.y - fontSize * 0.30,
+    width:  rectW,
+    height: rectH,
+    color:  PDFLib.rgb(1, 1, 1),
+    borderWidth: 0,
+  });
+
+  pdfPage.drawText(newText, {
+    x:    coords.x,
+    y:    coords.y,
+    size: fontSize,
+    font,
+    color: PDFLib.rgb(0, 0, 0),
+  });
+}
+
+/**
+ * Run the OCR fallback pipeline on the bottom half of page 1.
+ *
+ * @param {ArrayBuffer} arrayBuffer  Raw PDF bytes.
+ * @param {Array<{ width: number, height: number }>} pageDims
+ * @returns {Promise<{ ocrData: object, pageWidth: number, pageHeight: number, elapsed: string }>}
+ */
+async function performOCRFallback(arrayBuffer, pageDims) {
+  const startTime = performance.now();
+  const { width: pageWidth, height: pageHeight } = pageDims[0];
+
+  devLog(`OCR: rendering page at scale ${OCR_SCALE}…`);
+  const fullCanvas = await renderPDFPageToCanvas(arrayBuffer, 1, OCR_SCALE);
+
+  devLog('OCR: cropping bottom half…');
+  const cropCanvas = cropCanvasBottomHalf(fullCanvas);
+
+  if (DEV_MODE) {
+    devReport(`OCR: cutoff line (50 %) at PDF y = ${(pageHeight / 2).toFixed(1)} pt ` +
+              `(canvas row ${Math.floor(fullCanvas.height / 2)})`);
+  }
+
+  devLog(`OCR: running Tesseract.js (${OCR_LANGS})…`);
+  const ocrData = await runOCROnCanvas(cropCanvas, OCR_LANGS);
+
+  const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
+  devLog(`OCR: completed in ${elapsed} s — ${ocrData.lines?.length ?? 0} lines, ` +
+         `${ocrData.words?.length ?? 0} words`);
+  devLog(`OCR text:\n"${normalizeSpaces(ocrData.text)}"`);
+
+  if (DEV_MODE) {
+    devReport(`OCR time: ${elapsed} s`);
+    devReport(`OCR lines (${ocrData.lines?.length ?? 0}):`);
+    (ocrData.lines || []).forEach((l, i) => {
+      devReport(`  [${i}] conf=${l.confidence?.toFixed(1)} "${normalizeSpaces(l.text)}"`);
+    });
+  }
+
+  return { ocrData, pageWidth, pageHeight, elapsed };
+}
+
+/**
+ * Generate a modified PDF using OCR bbox positions for replacements.
+ * Only the bottom half of the page is touched.
+ *
+ * @param {ArrayBuffer} originalArrayBuffer
+ * @param {{ ocrData: object, pageWidth: number, pageHeight: number }} ocrResult
+ * @param {Array<{ width: number, height: number }>} pageDims
+ * @returns {Promise<Uint8Array>}
+ */
+async function generateOutputPDFWithOCR(originalArrayBuffer, ocrResult, pageDims) {
+  const { ocrData, pageHeight } = ocrResult;
+  const scale = OCR_SCALE;
+  const today = formatDateDDMMYYYY(new Date());
+
+  const pdfDoc  = await PDFLib.PDFDocument.load(originalArrayBuffer.slice(0));
+  const pages   = pdfDoc.getPages();
+  const pdfPage = pages[0];
+  const font    = await pdfDoc.embedFont(PDFLib.StandardFonts.Helvetica);
+
+  const ocrLines     = ocrData.lines || [];
+  const ocrLineTexts = ocrLines.map(l => normalizeSpaces(l.text));
+
+  // ── Helper: replace a required string found in OCR lines ────────────────
+  const replaceOCRString = (targetStr, replaceStr, label) => {
+    // Pass 1: individual lines
+    for (let i = 0; i < ocrLineTexts.length; i++) {
+      if (ocrLineTexts[i].includes(targetStr)) {
+        const coords = ocrBboxToPDF(ocrLines[i].bbox, pageHeight, scale);
+        applyOCROverlay(pdfPage, font, coords, replaceStr);
+        devLog(`OCR PDF: replaced ${label} at line ${i}`);
+        return true;
+      }
+    }
+    // Pass 2: sliding windows of 2–4 lines
+    for (let winSize = 2; winSize <= 4; winSize++) {
+      for (let i = 0; i <= ocrLineTexts.length - winSize; i++) {
+        const windowText = normalizeSpaces(ocrLineTexts.slice(i, i + winSize).join(' '));
+        if (windowText.includes(targetStr)) {
+          const firstBbox = ocrLines[i].bbox;
+          const lastBbox  = ocrLines[i + winSize - 1].bbox;
+          const combined  = {
+            x0: Math.min(firstBbox.x0, lastBbox.x0),
+            y0: firstBbox.y0,
+            x1: Math.max(firstBbox.x1, lastBbox.x1),
+            y1: lastBbox.y1,
+          };
+          const coords = ocrBboxToPDF(combined, pageHeight, scale);
+          applyOCROverlay(pdfPage, font, coords, replaceStr);
+          devLog(`OCR PDF: replaced ${label} at window lines ${i}–${i + winSize - 1}`);
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  replaceOCRString(REQUIRED_STR_1, REPLACE_STR_1, 'string 1');
+  replaceOCRString(REQUIRED_STR_2, REPLACE_STR_2, 'string 2');
+
+  // ── Date replacement via OCR words ──────────────────────────────────────
+  const RE_DATE_DDMM = /\b\d{2}\/\d{2}\/\d{4}\b/;
+  const RE_DATE_ISO  = /\b\d{4}-\d{2}-\d{2}\b/;
+  const handledLineIndices = new Set();
+  let dateCount = 0;
+
+  // Word-level dates
+  for (const word of (ocrData.words || [])) {
+    const cleanText = reconstructDates(normalizeSpaces(word.text));
+    if (!RE_DATE_DDMM.test(cleanText) && !RE_DATE_ISO.test(cleanText)) continue;
+    const newText = cleanText
+      .replace(/\b\d{2}\/\d{2}\/\d{4}\b/g, today)
+      .replace(/\b\d{4}-\d{2}-\d{2}\b/g,   today);
+    if (newText !== cleanText) {
+      dateCount++;
+      const coords = ocrBboxToPDF(word.bbox, pageHeight, scale);
+      applyOCROverlay(pdfPage, font, coords, newText);
+      devLog(`OCR PDF: date word "${cleanText}" → "${newText}"`);
+    }
+  }
+
+  // Line-level split dates
+  for (let i = 0; i < ocrLines.length; i++) {
+    if (handledLineIndices.has(i)) continue;
+    const lineText = reconstructDates(normalizeSpaces(ocrLines[i].text));
+    if (!RE_DATE_DDMM.test(lineText) && !RE_DATE_ISO.test(lineText)) continue;
+
+    const wordHasDate = (ocrLines[i].words || []).some(w => {
+      const t = reconstructDates(normalizeSpaces(w.text));
+      return RE_DATE_DDMM.test(t) || RE_DATE_ISO.test(t);
+    });
+    if (!wordHasDate) {
+      const newText = lineText
+        .replace(/\b\d{2}\/\d{2}\/\d{4}\b/g, today)
+        .replace(/\b\d{4}-\d{2}-\d{2}\b/g,   today);
+      if (newText !== lineText) {
+        dateCount++;
+        const coords = ocrBboxToPDF(ocrLines[i].bbox, pageHeight, scale);
+        applyOCROverlay(pdfPage, font, coords, newText);
+        handledLineIndices.add(i);
+        devLog(`OCR PDF: split date line "${lineText}" → "${newText}"`);
+      }
+    }
+  }
+
+  devLog(`OCR PDF: total dates replaced: ${dateCount}`);
+  return pdfDoc.save();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 8.  MAIN PIPELINE — process a single File
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -762,55 +1045,70 @@ async function processPDFFile(file) {
 
   const arrayBuffer = await file.arrayBuffer();
 
-  // ── Extract text ──────────────────────────────────────────────────────
-  const { fullText, pageItems, pageLines } = await extractPDFText(arrayBuffer);
+  // ── Extract text (text pipeline) ──────────────────────────────────────
+  const { fullText, pageItems, pageLines, pageDims } = await extractPDFText(arrayBuffer);
 
-  // ── Parse metadata ────────────────────────────────────────────────────
-  const { name, doc } = parseName(fullText);
-  const iae  = parseIAE(fullText);
-  const cnae = parseCNAE(fullText);
+  // ── Parse name from full page text (YO search — entire page) ──────────
+  let { name } = parseName(fullText);
 
-  // ── Validate required strings using multi-line scanning ───────────────
-  // Collect all line texts across all pages in reading order.
+  // ── Determine the 50 % cutoff for bottom-half filtering ───────────────
+  const pageHeight = pageDims[0] ? pageDims[0].height : null;
+
+  // ── Filter lines to bottom half only for replaceable-content search ───
+  // In PDF coordinates y = 0 is the page bottom; the visual bottom half
+  // corresponds to items with y <= pageHeight / 2.
+  let bottomHalfLineTexts;
+  if (pageHeight && pageLines && pageLines[0]) {
+    bottomHalfLineTexts = pageLines[0]
+      .filter(l => l.y <= pageHeight / 2)
+      .map(l => l.text);
+  } else {
+    bottomHalfLineTexts = (pageLines || []).flatMap(pg => pg.map(l => l.text));
+  }
+
+  // Also keep the full (unfiltered) line list for dev diagnostics.
   const allLineTexts = (pageLines || []).flatMap(pg => pg.map(l => l.text));
-  const { has1, has2, line1, line2 } = allLineTexts.length > 0
-    ? checkRequiredStringsInLines(allLineTexts)
-    : checkRequiredStrings(fullText);
 
-  // ── Dev mode report ───────────────────────────────────────────────────
+  // ── Parse IAE / CNAE from bottom half ─────────────────────────────────
+  const bottomText = bottomHalfLineTexts.join(' ');
+  let iae  = parseIAE(bottomText);
+  let cnae = parseCNAE(bottomText);
+
+  // ── Check required strings in bottom half ─────────────────────────────
+  let textCheck;
+  if (bottomHalfLineTexts.length > 0) {
+    textCheck = checkRequiredStringsInLines(bottomHalfLineTexts);
+  } else {
+    const cs = checkRequiredStrings(bottomText);
+    textCheck = { has1: cs.has1, has2: cs.has2, line1: null, line2: null };
+  }
+
+  let has1 = textCheck.has1;
+  let has2 = textCheck.has2;
+
+  // ── Dev mode: text-pipeline report ────────────────────────────────────
   devLog('─'.repeat(60));
   devLog(`File   : ${file.name}`);
-  devLog(`Name   : ${name ?? '(not found)'}   Doc: ${doc ?? '(not found)'}`);
+  devLog(`Name   : ${name ?? '(not found)'}`);
   devLog(`IAE    : ${iae  ?? '(not found)'}`);
   devLog(`CNAE   : ${cnae ?? '(not found)'}`);
-  devLog(`String 1 found: ${has1}  («${REQUIRED_STR_1}»)${line1 !== null ? ` at line ${line1}` : ''}`);
-  devLog(`String 2 found: ${has2}  («${REQUIRED_STR_2}»)${line2 !== null ? ` at line ${line2}` : ''}`);
+  devLog(`Cutoff : pageHeight=${pageHeight?.toFixed(1)}, bottom half y <= ${(pageHeight ? pageHeight / 2 : '?').toString()}`);
+  devLog(`String 1 found (text): ${has1}  («${REQUIRED_STR_1}»)`);
+  devLog(`String 2 found (text): ${has2}  («${REQUIRED_STR_2}»)`);
 
-  // Count dates found in text for diagnostics.
-  const datesDD  = (normalizeSpaces(fullText).match(/\b\d{2}\/\d{2}\/\d{4}\b/g) || []);
-  const datesISO = (normalizeSpaces(fullText).match(/\b\d{4}-\d{2}-\d{2}\b/g) || []);
-  devLog(`Dates found: ${datesDD.length} DD/MM/YYYY + ${datesISO.length} ISO = ${datesDD.length + datesISO.length} total`);
-  devLog(`Decision: ${has1 && has2 ? '✅ generate PDF' : '❌ manual edit required'}`);
+  const datesDD  = (normalizeSpaces(bottomText).match(/\b\d{2}\/\d{2}\/\d{4}\b/g) || []);
+  const datesISO = (normalizeSpaces(bottomText).match(/\b\d{4}-\d{2}-\d{2}\b/g) || []);
+  devLog(`Dates in bottom half: ${datesDD.length} DD/MM/YYYY + ${datesISO.length} ISO`);
 
   if (DEV_MODE) {
-    devReport(`\n--- SEARCH REPORT ---`);
-    // YO line
-    const yoIdx = allLineTexts.findIndex(t => t.match(/\bYO[,\s]/));
-    devReport(`  YO line: ${yoIdx >= 0 ? `line ${yoIdx}: "${allLineTexts[yoIdx]}"` : '(not found)'}`);
-    devReport(`  Name: ${name ?? '(not found)'}   Doc: ${doc ?? '(not found)'}`);
-    // IAE / CNAE
-    const iaeIdx = allLineTexts.findIndex(t => t.includes('IAE'));
-    const cnaeIdx = allLineTexts.findIndex(t => t.includes('CNAE'));
-    devReport(`  IAE: ${iae ?? '(not found)'} — line ${iaeIdx}`);
-    devReport(`  CNAE: ${cnae ?? '(not found)'} — line ${cnaeIdx}`);
-    // Required strings
-    devReport(`  String 1 (${has1 ? 'FOUND' : 'NOT FOUND'}): ${line1 !== null ? `line ${line1}` : '—'}`);
-    devReport(`  String 2 (${has2 ? 'FOUND' : 'NOT FOUND'}): ${line2 !== null ? `line ${line2}` : '—'}`);
-    // Dates
-    devReport(`  Dates (DD/MM/YYYY): ${datesDD.length} — ${datesDD.slice(0, 5).join(', ')}`);
-    devReport(`  Dates (ISO): ${datesISO.length} — ${datesISO.slice(0, 5).join(', ')}`);
-
-    // If strings not found, show candidate lines (debug aid)
+    devReport(`\n--- TEXT PIPELINE REPORT ---`);
+    devReport(`  Name: ${name ?? '(not found)'}`);
+    devReport(`  IAE: ${iae ?? '(not found)'}   CNAE: ${cnae ?? '(not found)'}`);
+    devReport(`  Page height: ${pageHeight?.toFixed(1)} pt — cutoff: ${(pageHeight ? pageHeight / 2 : '?').toString()} pt`);
+    devReport(`  Bottom-half lines: ${bottomHalfLineTexts.length}`);
+    devReport(`  String 1 (${has1 ? 'FOUND' : 'NOT FOUND'})`);
+    devReport(`  String 2 (${has2 ? 'FOUND' : 'NOT FOUND'})`);
+    devReport(`  Dates: ${datesDD.length} DD/MM/YYYY + ${datesISO.length} ISO`);
     if (!has1) {
       const cands = allLineTexts
         .map((t, i) => ({ t, i }))
@@ -823,31 +1121,116 @@ async function processPDFFile(file) {
         .filter(({ t }) => t.includes('AUTORIZADO') || t.includes('241384') || t.includes('RED'));
       devReport(`  Candidates for String 2: ${JSON.stringify(cands)}`);
     }
+  }
 
-    devReport(`\nDecision: ${has1 && has2 ? 'DONE' : 'MANUAL EDIT REQUIRED'}`);
+  // ── OCR fallback ──────────────────────────────────────────────────────
+  let usedOCR   = false;
+  let ocrResult = null;
 
-    // Update dev panel in UI
+  if (!has1 || !has2) {
+    const reasons = [];
+    if (!has1) reasons.push('Required string 1 not found in text');
+    if (!has2) reasons.push('Required string 2 not found in text');
+    devLog(`Text pipeline incomplete — triggering OCR fallback. Reasons: ${reasons.join('; ')}`);
+    if (DEV_MODE) {
+      devReport(`\n--- OCR FALLBACK ---`);
+      devReport(`  Trigger: ${reasons.join('; ')}`);
+    }
+
+    try {
+      ocrResult = await performOCRFallback(arrayBuffer, pageDims);
+      usedOCR = true;
+
+      const ocrLineTexts = (ocrResult.ocrData.lines || []).map(l => normalizeSpaces(l.text));
+      const ocrCheck = ocrLineTexts.length > 0
+        ? checkRequiredStringsInLines(ocrLineTexts)
+        : checkRequiredStrings(normalizeSpaces(ocrResult.ocrData.text));
+
+      // Combine: accept if either pipeline found the string.
+      has1 = has1 || ocrCheck.has1;
+      has2 = has2 || ocrCheck.has2;
+
+      devLog(`OCR check: has1=${ocrCheck.has1}, has2=${ocrCheck.has2}`);
+      if (DEV_MODE) {
+        devReport(`  OCR string 1: ${ocrCheck.has1 ? 'FOUND' : 'NOT FOUND'}`);
+        devReport(`  OCR string 2: ${ocrCheck.has2 ? 'FOUND' : 'NOT FOUND'}`);
+      }
+
+      // Try to pick up IAE / CNAE from OCR if text pipeline missed them.
+      if (!iae) {
+        const ocrIAE = parseIAE(normalizeSpaces(ocrResult.ocrData.text));
+        if (ocrIAE) { iae = ocrIAE; devLog(`OCR: found IAE ${iae}`); }
+      }
+      if (!cnae) {
+        const ocrCNAE = parseCNAE(normalizeSpaces(ocrResult.ocrData.text));
+        if (ocrCNAE) { cnae = ocrCNAE; devLog(`OCR: found CNAE ${cnae}`); }
+      }
+    } catch (ocrErr) {
+      devLog(`OCR failed: ${ocrErr.message}`);
+      if (DEV_MODE) devReport(`  OCR error: ${ocrErr.message}`);
+    }
+  }
+
+  // ── If name still missing, try full-page OCR for name only ────────────
+  if (!name) {
+    if (usedOCR && ocrResult) {
+      // First check bottom-half OCR text (may contain YO line).
+      const ocrName = parseName(normalizeSpaces(ocrResult.ocrData.text));
+      if (ocrName.name) {
+        name = ocrName.name;
+        devLog(`OCR (bottom half): found name "${name}"`);
+      }
+    }
+    if (!name) {
+      try {
+        devLog('Running full-page OCR for name extraction…');
+        const fullCanvas = await renderPDFPageToCanvas(arrayBuffer, 1, OCR_SCALE);
+        const fullOCR    = await runOCROnCanvas(fullCanvas, OCR_LANGS);
+        const ocrName    = parseName(normalizeSpaces(fullOCR.text));
+        if (ocrName.name) {
+          name = ocrName.name;
+          devLog(`OCR (full page): found name "${name}"`);
+        }
+      } catch (e) {
+        devLog(`Full-page OCR for name failed: ${e.message}`);
+      }
+    }
+  }
+
+  // ── Final dev report ──────────────────────────────────────────────────
+  const pipelineLabel = usedOCR ? 'text + OCR' : 'text';
+  devLog(`Final decision (${pipelineLabel}): ${has1 && has2 ? '✅ generate PDF' : '❌ manual edit required'}`);
+  if (DEV_MODE) {
+    devReport(`\nFinal: pipeline=${pipelineLabel}, has1=${has1}, has2=${has2}`);
+    devReport(`Decision: ${has1 && has2 ? 'DONE' : 'MANUAL EDIT REQUIRED'}`);
     updateDevPanel(file.name, _debugReport.join('\n'));
   }
 
+  // ── Fail: required strings not found ──────────────────────────────────
   if (!has1 || !has2) {
     const missing = [];
     if (!has1) missing.push(`«${REQUIRED_STR_1}»`);
     if (!has2) missing.push(`«${REQUIRED_STR_2}»`);
+    const prefix = usedOCR ? 'OCR: ' : '';
     return {
-      fileName:     file.name,
-      name:         name ?? '—',
-      iae:          iae  ?? '—',
-      cnae:         cnae ?? '—',
-      status:       'error',
-      message:      `Необходимо ручное редактирование. Не найдено: ${missing.join(', ')}`,
-      outputBytes:  null,
+      fileName:       file.name,
+      name:           name ?? '—',
+      iae:            iae  ?? '—',
+      cnae:           cnae ?? '—',
+      status:         'error',
+      message:        `${prefix}Необходимо ручное редактирование. Не найдено: ${missing.join(', ')}`,
+      outputBytes:    null,
       outputFileName: null,
     };
   }
 
   // ── Generate output PDF ───────────────────────────────────────────────
-  const outputBytes = await generateOutputPDF(arrayBuffer, pageItems, pageLines);
+  let outputBytes;
+  if (usedOCR && ocrResult) {
+    outputBytes = await generateOutputPDFWithOCR(arrayBuffer, ocrResult, pageDims);
+  } else {
+    outputBytes = await generateOutputPDF(arrayBuffer, pageItems, pageLines, pageDims);
+  }
 
   // Build sanitised output filename.
   const baseName = name
@@ -861,7 +1244,7 @@ async function processPDFFile(file) {
     iae:           iae  ?? '—',
     cnae:          cnae ?? '—',
     status:        'done',
-    message:       'OK',
+    message:       usedOCR ? 'OK (OCR)' : 'OK',
     outputBytes,
     outputFileName,
   };
