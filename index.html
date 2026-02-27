@@ -225,7 +225,11 @@
         integrity="sha384-weMABwrltA6jWR8DDe9Jp5blk+tZQh7ugpCsF3JwSA53WZM9/14PjS5LAJNHNjAI"
         crossorigin="anonymous"></script>
 
-<!-- Application logic (ES module; can access pdfjsLib + PDFLib globals) -->
+<!-- Tesseract.js — OCR engine for automatic fallback text recognition (pinned v5.1.1) -->
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"
+        crossorigin="anonymous"></script>
+
+<!-- Application logic (ES module; can access pdfjsLib + PDFLib + Tesseract globals) -->
 <script type="module" src="app.js"></script>
 </body>
 </html>
