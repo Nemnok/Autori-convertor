@@ -847,14 +847,15 @@ function ocrBboxToPDF(bbox, pageHeight, scale) {
  * @param {string} newText      Replacement string.
  */
 function applyOCROverlay(pdfPage, font, coords, newText) {
-  const fontSize  = Math.max(coords.height * 0.85, 6);
+  // Scale factor and minimum match those used by applyTextOverlay.
+  const fontSize  = Math.max(coords.height * 0.85, 6);   // 85 % of bbox height; min 6 pt
   const textWidth = font.widthOfTextAtSize(newText, fontSize);
   const rectW     = Math.max(coords.width, textWidth) + 4;
-  const rectH     = coords.height * 1.45;
+  const rectH     = coords.height * 1.45;                 // extra vertical padding
 
   pdfPage.drawRectangle({
     x:      coords.x - 1,
-    y:      coords.y - fontSize * 0.30,
+    y:      coords.y - fontSize * 0.30,                    // shift below baseline for descenders
     width:  rectW,
     height: rectH,
     color:  PDFLib.rgb(1, 1, 1),
@@ -1092,7 +1093,7 @@ async function processPDFFile(file) {
   devLog(`Name   : ${name ?? '(not found)'}`);
   devLog(`IAE    : ${iae  ?? '(not found)'}`);
   devLog(`CNAE   : ${cnae ?? '(not found)'}`);
-  devLog(`Cutoff : pageHeight=${pageHeight?.toFixed(1)}, bottom half y <= ${(pageHeight ? pageHeight / 2 : '?').toString()}`);
+  devLog(`Cutoff : pageHeight=${pageHeight?.toFixed(1)}, bottom half y <= ${pageHeight ? (pageHeight / 2).toFixed(1) : '?'}`);
   devLog(`String 1 found (text): ${has1}  («${REQUIRED_STR_1}»)`);
   devLog(`String 2 found (text): ${has2}  («${REQUIRED_STR_2}»)`);
 
