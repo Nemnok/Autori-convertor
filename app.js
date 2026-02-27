@@ -169,7 +169,7 @@ function parseName(text) {
   // DNI/NIE format: starts with alphanumeric [A-Z0-9], followed by 7-8 digits,
   // optionally ending with alphanumeric [A-Z0-9]? (e.g. "X1234567A", "12345678Z").
   // Separator between name and DNI can be comma+space or just whitespace.
-  const match = norm.match(/\bYO,\s+(.+?)[,\s]+([A-Z0-9]\d{7,8}[A-Z0-9]?)\b/);
+  const match = norm.match(/\bYO,\s+(.+?)(?:,\s*|\s+)([A-Z0-9]\d{7,8}[A-Z0-9]?)\b/);
   if (!match) return { name: null, doc: null };
   return { name: match[1].trim(), doc: match[2].trim() };
 }
