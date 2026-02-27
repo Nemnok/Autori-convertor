@@ -9,7 +9,8 @@
  *   • PDF.js  → window.pdfjsLib
  *   • pdf-lib → window.PDFLib
  *
- * URL flag: append  ?dev  to enable verbose console logging.
+ * URL flags:
+ *   ?dev  — enable verbose console logging + debug UI panel + canvas overlay
  */
 
 'use strict';
@@ -18,8 +19,13 @@
 // 1.  CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Exact string that MUST appear in the source PDF (after space normalisation). */
-const REQUIRED_STR_1 = 'A NATALIA MENSHUTKINA CON DNI 79235585X';
+/**
+ * Exact string that MUST appear in the source PDF (after space normalisation).
+ * NOTE: The source PDFs use the double surname "MENSHUTKINA MENSHUTKINA" as
+ * rendered by the document editor — this is the literal text in the content
+ * stream and must be matched exactly.
+ */
+const REQUIRED_STR_1 = 'A NATALIA MENSHUTKINA MENSHUTKINA CON DNI 79235585X';
 /** Replacement for REQUIRED_STR_1. */
 const REPLACE_STR_1  = 'A NALOGI ASESORES S.L.U. CIF B25973512';
 
@@ -42,8 +48,11 @@ const DOWNLOAD_DELAY_MAX = 800;
  */
 const URL_REVOKE_DELAY_MS = 60_000;
 
-/** Enable verbose dev logging when URL contains ?dev */
+/** Enable verbose dev logging + debug UI when URL contains ?dev */
 const DEV_MODE = new URLSearchParams(window.location.search).has('dev');
+
+/** Accumulates debug info for the "Copy debug report" button. */
+let _debugReport = [];
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 2.  LOGGING HELPER
@@ -52,6 +61,11 @@ const DEV_MODE = new URLSearchParams(window.location.search).has('dev');
 /** Log only when ?dev is present in the URL. */
 const devLog = (...args) => {
   if (DEV_MODE) console.log('[DEV]', ...args);
+};
+
+/** Append a line to the debug report buffer (used by dev panel). */
+const devReport = (line) => {
+  if (DEV_MODE) _debugReport.push(line);
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -84,12 +98,29 @@ function sanitizeFileName(name) {
 }
 
 /**
+ * Strip invisible / zero-width / control characters that PDF extractors
+ * sometimes emit (zero-width spaces, NBSP, soft hyphens, BOM, etc.).
+ * @param {string} str
+ * @returns {string}
+ */
+function stripInvisible(str) {
+  return str
+    // soft hyphen, zero-width space/non-joiner/joiner, word-joiner, BOM
+    .replace(/[\u00ad\u200b\u200c\u200d\u2060\ufeff]/g, '')
+    // non-breaking space → regular space
+    .replace(/\u00a0/g, ' ')
+    // line/paragraph separators → space
+    .replace(/[\u2028\u2029]/g, ' ');
+}
+
+/**
  * Collapse all whitespace sequences to a single space and trim.
+ * Also strips invisible characters first.
  * @param {string} str
  * @returns {string}
  */
 function normalizeSpaces(str) {
-  return str.replace(/\s+/g, ' ').trim();
+  return stripInvisible(str).replace(/\s+/g, ' ').trim();
 }
 
 /**
@@ -152,6 +183,18 @@ function runSelfChecks() {
     'Self-check FAIL: sanitizeFileName max length'
   );
 
+  // stripInvisible
+  console.assert(
+    stripInvisible('A\u200bB\u00adC\u00a0D') === 'AB C D',
+    'Self-check FAIL: stripInvisible'
+  );
+
+  // normalizeSpaces with invisible chars
+  console.assert(
+    normalizeSpaces('A\u00a0 B\u200b  C') === 'A B C',
+    'Self-check FAIL: normalizeSpaces invisible'
+  );
+
   devLog('Self-checks passed ✓');
 }
 
@@ -197,6 +240,56 @@ function parseCNAE(text) {
 }
 
 /**
+ * Build a "full page text" from reconstructed lines by joining them with a
+ * single space (for cross-line search).  Lines are passed in reading order.
+ * @param {string[]} lineTexts
+ * @returns {string}
+ */
+function buildFullPageText(lineTexts) {
+  return normalizeSpaces(lineTexts.join(' '));
+}
+
+/**
+ * Check whether both required strings are present anywhere in the provided
+ * line texts (after space normalisation — exact, case-sensitive match).
+ *
+ * Strategy:
+ *  1. Check each individual line (handles same-line occurrence).
+ *  2. Check sliding windows of 2–4 consecutive lines joined with a space
+ *     (handles cross-line / line-wrapped occurrences).
+ *  3. Check full concatenation of the page (last resort).
+ *
+ * @param {string[]} lineTexts  Normalised line strings in reading order.
+ * @returns {{ has1: boolean, has2: boolean,
+ *             line1: number|null, line2: number|null }}
+ *   line1/line2 = 0-based index of the first matching line (or window start).
+ */
+function checkRequiredStringsInLines(lineTexts) {
+  let has1 = false, has2 = false;
+  let line1 = null, line2 = null;
+
+  // Pass 1: individual lines
+  for (let i = 0; i < lineTexts.length; i++) {
+    const t = lineTexts[i];
+    if (!has1 && t.includes(REQUIRED_STR_1)) { has1 = true; line1 = i; }
+    if (!has2 && t.includes(REQUIRED_STR_2)) { has2 = true; line2 = i; }
+    if (has1 && has2) return { has1, has2, line1, line2 };
+  }
+
+  // Pass 2: sliding windows of 2–4 lines
+  for (let winSize = 2; winSize <= 4; winSize++) {
+    for (let i = 0; i <= lineTexts.length - winSize; i++) {
+      const window = normalizeSpaces(lineTexts.slice(i, i + winSize).join(' '));
+      if (!has1 && window.includes(REQUIRED_STR_1)) { has1 = true; line1 = i; }
+      if (!has2 && window.includes(REQUIRED_STR_2)) { has2 = true; line2 = i; }
+      if (has1 && has2) return { has1, has2, line1, line2 };
+    }
+  }
+
+  return { has1, has2, line1, line2 };
+}
+
+/**
  * Check whether both required strings are present in the text
  * (after space normalisation — exact, case-sensitive match).
  * @param {string} text
@@ -226,7 +319,7 @@ function checkRequiredStrings(text) {
  */
 function smartJoinLineItems(lineItems, gapTol = 2) {
   if (lineItems.length === 0) return '';
-  let text = lineItems[0].str;
+  let text = normalizeSpaces(lineItems[0].str);
   for (let i = 1; i < lineItems.length; i++) {
     const prev = lineItems[i - 1];
     const curr = lineItems[i];
@@ -234,9 +327,9 @@ function smartJoinLineItems(lineItems, gapTol = 2) {
     const currStart = curr.transform[4];
     const gap = currStart - prevEnd;
     if (gap >= gapTol) text += ' ';
-    text += curr.str;
+    text += normalizeSpaces(curr.str);
   }
-  return text;
+  return normalizeSpaces(text);
 }
 
 /**
@@ -285,12 +378,34 @@ function mergeAdjacentItems(items, yTol = 4, gapTol = 2) {
 }
 
 /**
+ * Reconstruct "clean" date strings from fragmented line text by removing
+ * interior spaces between the numeric components of a date.
+ *
+ * E.g. "26 / 02 /202 6" → "26/02/2026"
+ *       "0 8/11 /2023"  → "08/11/2023"
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function reconstructDates(text) {
+  // Remove spaces inside DD / MM / YYYY style dates (with possible spaces
+  // around slashes and inside digit groups).
+  return text
+    // spaces around slashes in DD / MM / YYYY
+    .replace(/(\d{1,2})\s*\/\s*(\d{1,2})\s*\/\s*(\d{2,4})\s*(\d*)/g,
+      (_, d, m, y1, y2) => `${d.padStart(2,'0')}/${m.padStart(2,'0')}/${(y1 + y2).padStart(4,'0')}`)
+    // ISO dates with spaces
+    .replace(/(\d{4})\s*-\s*(\d{2})\s*-\s*(\d{2})/g, '$1-$2-$3');
+}
+
+/**
  * Extract text and item positions from all pages of a PDF.
  *
  * @param {ArrayBuffer} arrayBuffer  Raw PDF bytes.
  * @returns {Promise<{
  *   fullText: string,
- *   pageItems: Array<{ pageNum: number, items: object[] }>
+ *   pageItems: Array<{ pageNum: number, items: object[] }>,
+ *   pageLines: Array<Array<{ y: number, text: string, items: object[] }>>
  * }>}
  */
 async function extractPDFText(arrayBuffer) {
@@ -301,25 +416,56 @@ async function extractPDFText(arrayBuffer) {
 
   let fullText = '';
   const pageItems = [];
+  const pageLines = []; // per-page array of { y, text, items }
+
+  if (DEV_MODE) {
+    devReport(`=== PDF: ${pdf.numPages} page(s) ===`);
+  }
 
   for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
     const page = await pdf.getPage(pageNum);
     const content = await page.getTextContent({ includeMarkedContent: false });
     // Keep only items that have non-empty string content.
-    const rawItems = content.items.filter(it => it.str && it.str.length > 0);
+    const rawItems = content.items.filter(it => it.str && typeof it.str === 'string' && it.str.trim().length > 0);
 
     // Merge positionally adjacent items to fix text fragmentation
     // (dates, split words, etc.).
     const items = mergeAdjacentItems(rawItems);
     pageItems.push({ pageNum, items });
 
-    // Build fullText using smart position-based joining.
-    const lines = groupItemsByLine(items);
-    fullText += lines.map(line => smartJoinLineItems(line)).join(' ') + '\n';
+    // Build reconstructed lines with y, text, and source items.
+    const lineGroups = groupItemsByLine(items);
+    const lines = lineGroups.map((lineItems, idx) => ({
+      lineIndex: idx,
+      y: lineItems[0] ? lineItems[0].transform[5] : 0,
+      text: normalizeSpaces(reconstructDates(smartJoinLineItems(lineItems))),
+      items: lineItems,
+    }));
+    pageLines.push(lines);
+
+    // Build fullText using reconstructed line texts.
+    fullText += lines.map(l => l.text).join(' ') + '\n';
+
+    if (DEV_MODE) {
+      devReport(`--- Page ${pageNum}: ${rawItems.length} rawItems, ${items.length} merged, ${lines.length} lines ---`);
+      // Top-50 longest items
+      const top50 = [...items]
+        .sort((a, b) => (b.str || '').length - (a.str || '').length)
+        .slice(0, 50);
+      devReport(`  Top-${Math.min(50, top50.length)} items by length:`);
+      top50.forEach(it => {
+        devReport(`    [x=${Math.round(it.transform[4])},y=${Math.round(it.transform[5])}] "${normalizeSpaces(it.str)}"`);
+      });
+      // Reconstructed lines dump
+      devReport(`  Reconstructed lines:`);
+      lines.forEach(l => {
+        devReport(`    [line=${l.lineIndex},y=${Math.round(l.y)}] "${l.text}"`);
+      });
+    }
   }
 
   pdf.destroy();
-  return { fullText, pageItems };
+  return { fullText, pageItems, pageLines };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -459,11 +605,15 @@ function applyTextOverlay(pdfPage, font, items, newText) {
  *   • All DD/MM/YYYY and YYYY-MM-DD date occurrences → today's date.
  *   • The two required literal strings → their respective replacements.
  *
+ * Cross-line strings are handled by scanning windows of 2–4 consecutive
+ * lines; the first line in the window receives the overlay in that case.
+ *
  * @param {ArrayBuffer} originalArrayBuffer
  * @param {Array<{ pageNum: number, items: object[] }>} pageItems
+ * @param {Array<Array<{ y: number, text: string, items: object[] }>>} pageLines
  * @returns {Promise<Uint8Array>}  Bytes of the output PDF.
  */
-async function generateOutputPDF(originalArrayBuffer, pageItems) {
+async function generateOutputPDF(originalArrayBuffer, pageItems, pageLines) {
   const today = formatDateDDMMYYYY(new Date());
 
   // pdf-lib needs its own copy of the buffer.
@@ -482,44 +632,101 @@ async function generateOutputPDF(originalArrayBuffer, pageItems) {
   for (let pi = 0; pi < pages.length; pi++) {
     const pdfPage = pages[pi];
     const { items } = pageItems[pi] || { items: [] };
+    const lines = pageLines ? pageLines[pi] : null;
 
-    const lines = groupItemsByLine(items);
+    // Use the pre-reconstructed lines if available, otherwise rebuild.
+    const lineGroups = groupItemsByLine(items);
+    const lineCount = lineGroups.length;
 
-    for (const line of lines) {
-      const lineText = normalizeSpaces(smartJoinLineItems(line));
+    // ── Track which lines have been handled to avoid double-overlay ───────
+    const handled = new Set();
 
-      // ── String replacement 1 ────────────────────────────────────────────
-      if (lineText.includes(REQUIRED_STR_1)) {
-        const matchItems = findItemsForString(line, REQUIRED_STR_1);
-        if (matchItems && matchItems.length > 0) {
-          devLog(`Page ${pi + 1}: replacing string 1`);
-          applyTextOverlay(pdfPage, font, matchItems, REPLACE_STR_1);
+    // ── String replacements: first try individual lines, then windows ─────
+    const applyStringReplacement = (targetStr, replaceStr, label) => {
+      // Pass 1: individual lines
+      for (let li = 0; li < lineCount; li++) {
+        const lineText = normalizeSpaces(reconstructDates(smartJoinLineItems(lineGroups[li])));
+        if (lineText.includes(targetStr)) {
+          const matchItems = findItemsForString(lineGroups[li], targetStr);
+          if (matchItems && matchItems.length > 0) {
+            devLog(`Page ${pi + 1}: replacing ${label} (line ${li})`);
+            applyTextOverlay(pdfPage, font, matchItems, replaceStr);
+            handled.add(li);
+            return true;
+          }
         }
-        continue; // REQUIRED_STR_1 and REQUIRED_STR_2 cannot share a line
       }
-
-      // ── String replacement 2 ────────────────────────────────────────────
-      if (lineText.includes(REQUIRED_STR_2)) {
-        const matchItems = findItemsForString(line, REQUIRED_STR_2);
-        if (matchItems && matchItems.length > 0) {
-          devLog(`Page ${pi + 1}: replacing string 2`);
-          applyTextOverlay(pdfPage, font, matchItems, REPLACE_STR_2);
+      // Pass 2: sliding windows of 2–4 lines
+      for (let winSize = 2; winSize <= 4; winSize++) {
+        for (let li = 0; li <= lineCount - winSize; li++) {
+          const windowItems = lineGroups.slice(li, li + winSize).flat();
+          const windowText = normalizeSpaces(
+            reconstructDates(smartJoinLineItems(
+              windowItems.sort((a, b) => {
+                const dy = b.transform[5] - a.transform[5];
+                return Math.abs(dy) > 4 ? dy : a.transform[4] - b.transform[4];
+              })
+            ))
+          );
+          if (windowText.includes(targetStr)) {
+            const matchItems = findItemsForString(windowItems, targetStr);
+            if (matchItems && matchItems.length > 0) {
+              devLog(`Page ${pi + 1}: replacing ${label} (window lines ${li}–${li + winSize - 1})`);
+              applyTextOverlay(pdfPage, font, matchItems, replaceStr);
+              for (let k = li; k < li + winSize; k++) handled.add(k);
+              return true;
+            }
+          }
         }
-        continue;
       }
+      return false;
+    };
 
-      // ── Date replacement (item-by-item) ─────────────────────────────────
-      for (const item of line) {
-        if (!RE_DATE_DDMM.test(item.str) && !RE_DATE_ISO.test(item.str)) continue;
+    applyStringReplacement(REQUIRED_STR_1, REPLACE_STR_1, 'string 1');
+    applyStringReplacement(REQUIRED_STR_2, REPLACE_STR_2, 'string 2');
 
-        const newStr = item.str
+    // ── Date replacement (item-by-item, skip already-handled lines) ───────
+    for (let li = 0; li < lineCount; li++) {
+      if (handled.has(li)) continue;
+      for (const item of lineGroups[li]) {
+        // Reconstruct a clean date string from the item (handles fragmentation)
+        const cleanStr = reconstructDates(normalizeSpaces(item.str));
+        if (!RE_DATE_DDMM.test(cleanStr) && !RE_DATE_ISO.test(cleanStr)) continue;
+
+        const newStr = cleanStr
           .replace(/\b\d{2}\/\d{2}\/\d{4}\b/g, today)
           .replace(/\b\d{4}-\d{2}-\d{2}\b/g,   today);
 
-        if (newStr !== item.str) {
+        if (newStr !== cleanStr) {
           dateCount++;
           devLog(`Page ${pi + 1}: date "${item.str}" → "${newStr}"`);
           applyTextOverlay(pdfPage, font, [item], newStr);
+        }
+      }
+    }
+
+    // ── Also check line-level reconstructed dates (handles split dates) ───
+    for (let li = 0; li < lineCount; li++) {
+      if (handled.has(li)) continue;
+      const lineText = normalizeSpaces(reconstructDates(smartJoinLineItems(lineGroups[li])));
+      if (!RE_DATE_DDMM.test(lineText) && !RE_DATE_ISO.test(lineText)) continue;
+
+      // Check if line text has a date that no individual item had
+      // (means the date was split across items).
+      const hasDateInItems = lineGroups[li].some(it => {
+        const clean = reconstructDates(normalizeSpaces(it.str));
+        return RE_DATE_DDMM.test(clean) || RE_DATE_ISO.test(clean);
+      });
+      if (!hasDateInItems) {
+        // The date is formed by combining multiple items — overlay the whole line.
+        const newLineText = lineText
+          .replace(/\b\d{2}\/\d{2}\/\d{4}\b/g, today)
+          .replace(/\b\d{4}-\d{2}-\d{2}\b/g,   today);
+        if (newLineText !== lineText) {
+          dateCount++;
+          devLog(`Page ${pi + 1}: split date line "${lineText}" → "${newLineText}"`);
+          applyTextOverlay(pdfPage, font, lineGroups[li], newLineText);
+          handled.add(li);
         }
       }
     }
@@ -546,31 +753,82 @@ async function generateOutputPDF(originalArrayBuffer, pageItems) {
  * @returns {Promise<Result>}
  */
 async function processPDFFile(file) {
+  if (DEV_MODE) {
+    _debugReport = [];
+    devReport(`\n${'═'.repeat(60)}`);
+    devReport(`FILE: ${file.name}`);
+    devReport(`${'═'.repeat(60)}`);
+  }
+
   const arrayBuffer = await file.arrayBuffer();
 
   // ── Extract text ──────────────────────────────────────────────────────
-  const { fullText, pageItems } = await extractPDFText(arrayBuffer);
+  const { fullText, pageItems, pageLines } = await extractPDFText(arrayBuffer);
 
   // ── Parse metadata ────────────────────────────────────────────────────
   const { name, doc } = parseName(fullText);
   const iae  = parseIAE(fullText);
   const cnae = parseCNAE(fullText);
 
-  // ── Validate required strings ─────────────────────────────────────────
-  const { has1, has2 } = checkRequiredStrings(fullText);
+  // ── Validate required strings using multi-line scanning ───────────────
+  // Collect all line texts across all pages in reading order.
+  const allLineTexts = (pageLines || []).flatMap(pg => pg.map(l => l.text));
+  const { has1, has2, line1, line2 } = allLineTexts.length > 0
+    ? checkRequiredStringsInLines(allLineTexts)
+    : checkRequiredStrings(fullText);
 
+  // ── Dev mode report ───────────────────────────────────────────────────
   devLog('─'.repeat(60));
   devLog(`File   : ${file.name}`);
   devLog(`Name   : ${name ?? '(not found)'}   Doc: ${doc ?? '(not found)'}`);
   devLog(`IAE    : ${iae  ?? '(not found)'}`);
   devLog(`CNAE   : ${cnae ?? '(not found)'}`);
-  devLog(`String 1 found: ${has1}  («${REQUIRED_STR_1}»)`);
-  devLog(`String 2 found: ${has2}  («${REQUIRED_STR_2}»)`);
+  devLog(`String 1 found: ${has1}  («${REQUIRED_STR_1}»)${line1 !== null ? ` at line ${line1}` : ''}`);
+  devLog(`String 2 found: ${has2}  («${REQUIRED_STR_2}»)${line2 !== null ? ` at line ${line2}` : ''}`);
+
   // Count dates found in text for diagnostics.
-  const datesDD = (normalizeSpaces(fullText).match(/\b\d{2}\/\d{2}\/\d{4}\b/g) || []);
+  const datesDD  = (normalizeSpaces(fullText).match(/\b\d{2}\/\d{2}\/\d{4}\b/g) || []);
   const datesISO = (normalizeSpaces(fullText).match(/\b\d{4}-\d{2}-\d{2}\b/g) || []);
   devLog(`Dates found: ${datesDD.length} DD/MM/YYYY + ${datesISO.length} ISO = ${datesDD.length + datesISO.length} total`);
   devLog(`Decision: ${has1 && has2 ? '✅ generate PDF' : '❌ manual edit required'}`);
+
+  if (DEV_MODE) {
+    devReport(`\n--- SEARCH REPORT ---`);
+    // YO line
+    const yoIdx = allLineTexts.findIndex(t => t.match(/\bYO[,\s]/));
+    devReport(`  YO line: ${yoIdx >= 0 ? `line ${yoIdx}: "${allLineTexts[yoIdx]}"` : '(not found)'}`);
+    devReport(`  Name: ${name ?? '(not found)'}   Doc: ${doc ?? '(not found)'}`);
+    // IAE / CNAE
+    const iaeIdx = allLineTexts.findIndex(t => t.includes('IAE'));
+    const cnaeIdx = allLineTexts.findIndex(t => t.includes('CNAE'));
+    devReport(`  IAE: ${iae ?? '(not found)'} — line ${iaeIdx}`);
+    devReport(`  CNAE: ${cnae ?? '(not found)'} — line ${cnaeIdx}`);
+    // Required strings
+    devReport(`  String 1 (${has1 ? 'FOUND' : 'NOT FOUND'}): ${line1 !== null ? `line ${line1}` : '—'}`);
+    devReport(`  String 2 (${has2 ? 'FOUND' : 'NOT FOUND'}): ${line2 !== null ? `line ${line2}` : '—'}`);
+    // Dates
+    devReport(`  Dates (DD/MM/YYYY): ${datesDD.length} — ${datesDD.slice(0, 5).join(', ')}`);
+    devReport(`  Dates (ISO): ${datesISO.length} — ${datesISO.slice(0, 5).join(', ')}`);
+
+    // If strings not found, show candidate lines (debug aid)
+    if (!has1) {
+      const cands = allLineTexts
+        .map((t, i) => ({ t, i }))
+        .filter(({ t }) => t.includes('NATALIA') || t.includes('MENSHUTKINA') || t.includes('79235585'));
+      devReport(`  Candidates for String 1: ${JSON.stringify(cands)}`);
+    }
+    if (!has2) {
+      const cands = allLineTexts
+        .map((t, i) => ({ t, i }))
+        .filter(({ t }) => t.includes('AUTORIZADO') || t.includes('241384') || t.includes('RED'));
+      devReport(`  Candidates for String 2: ${JSON.stringify(cands)}`);
+    }
+
+    devReport(`\nDecision: ${has1 && has2 ? 'DONE' : 'MANUAL EDIT REQUIRED'}`);
+
+    // Update dev panel in UI
+    updateDevPanel(file.name, _debugReport.join('\n'));
+  }
 
   if (!has1 || !has2) {
     const missing = [];
@@ -589,7 +847,7 @@ async function processPDFFile(file) {
   }
 
   // ── Generate output PDF ───────────────────────────────────────────────
-  const outputBytes = await generateOutputPDF(arrayBuffer, pageItems);
+  const outputBytes = await generateOutputPDF(arrayBuffer, pageItems, pageLines);
 
   // Build sanitised output filename.
   const baseName = name
@@ -670,6 +928,83 @@ const hintBanner     = document.getElementById('hint');
 /** Shared results array, re-populated on each Generate run. */
 let results = [];
 
+// ── Dev panel (only rendered in ?dev mode) ────────────────────────────────
+let devPanelEl = null;
+let devTextEl  = null;
+
+/**
+ * Create and inject the dev panel DOM (once) if ?dev is active.
+ */
+function ensureDevPanel() {
+  if (!DEV_MODE || devPanelEl) return;
+
+  devPanelEl = document.createElement('div');
+  devPanelEl.id = 'devPanel';
+  devPanelEl.style.cssText = [
+    'background:#1a1a2e', 'color:#e0e0e0', 'border-radius:8px',
+    'padding:16px', 'margin-top:20px', 'font-family:monospace',
+    'font-size:0.78rem', 'overflow-wrap:break-word', 'word-break:break-word',
+    'max-height:500px', 'overflow-y:auto', 'box-shadow:0 2px 10px rgba(0,0,0,0.3)',
+  ].join(';');
+
+  const header = document.createElement('div');
+  header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;';
+  header.innerHTML = '<span style="color:#7dd3fc;font-weight:700">🔍 DEV DEBUG PANEL</span>';
+
+  const copyBtn = document.createElement('button');
+  copyBtn.textContent = '📋 Copy debug report';
+  copyBtn.style.cssText = [
+    'background:#4299e1', 'color:#fff', 'border:none', 'border-radius:4px',
+    'padding:4px 10px', 'cursor:pointer', 'font-size:0.78rem', 'font-weight:600',
+  ].join(';');
+  copyBtn.addEventListener('click', () => {
+    const text = _debugReport.join('\n');
+    navigator.clipboard.writeText(text).then(() => {
+      copyBtn.textContent = '✅ Copied!';
+      setTimeout(() => { copyBtn.textContent = '📋 Copy debug report'; }, 2000);
+    }).catch(() => {
+      // Fallback: show a selectable textarea
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;top:10%;left:5%;width:90%;height:70%;z-index:9999;font-size:12px;';
+      const overlay = document.createElement('div');
+      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9998;';
+      const closeBtn = document.createElement('button');
+      closeBtn.textContent = '✕ Close';
+      closeBtn.style.cssText = 'position:fixed;top:8%;right:6%;z-index:9999;padding:6px 14px;cursor:pointer;';
+      const close = () => { ta.remove(); overlay.remove(); closeBtn.remove(); };
+      overlay.addEventListener('click', close);
+      closeBtn.addEventListener('click', close);
+      document.body.append(overlay, ta, closeBtn);
+      ta.select();
+    });
+  });
+
+  header.appendChild(copyBtn);
+  devPanelEl.appendChild(header);
+
+  devTextEl = document.createElement('pre');
+  devTextEl.style.cssText = 'margin:0;color:#d1fae5;font-size:0.75rem;';
+  devPanelEl.appendChild(devTextEl);
+
+  document.querySelector('.container').appendChild(devPanelEl);
+}
+
+/**
+ * Update the dev panel text with the current debug report.
+ * @param {string} fileName
+ * @param {string} reportText
+ */
+function updateDevPanel(fileName, reportText) {
+  if (!DEV_MODE) return;
+  ensureDevPanel();
+  if (devTextEl) {
+    devTextEl.textContent = reportText;
+    // Scroll to bottom
+    devPanelEl.scrollTop = devPanelEl.scrollHeight;
+  }
+}
+
 // ── File-input change: enable / disable Generate button ───────────────────
 fileInput.addEventListener('change', () => {
   const n = fileInput.files.length;
@@ -712,11 +1047,14 @@ generateBtn.addEventListener('click', async () => {
   generateBtn.disabled    = true;
   downloadAllBtn.disabled = true;
   hintBanner.style.display = 'none';
+  if (devTextEl) devTextEl.textContent = '';
 
   // Show section and progress bar.
   resultsSection.style.display = 'block';
   progressWrap.style.display   = 'block';
   progressFill.style.width     = '0%';
+
+  if (DEV_MODE) ensureDevPanel();
 
   let doneCount = 0;
 
@@ -766,6 +1104,12 @@ downloadAllBtn.addEventListener('click', async () => {
   await downloadAll(results);
   downloadAllBtn.disabled = false;
 });
+
+// ── Dev mode indicator in page title ──────────────────────────────────────
+if (DEV_MODE) {
+  document.title = '[DEV] ' + document.title;
+  ensureDevPanel();
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 11.  INITIALISATION
