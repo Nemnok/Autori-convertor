@@ -168,7 +168,8 @@ function parseName(text) {
   const norm = normalizeSpaces(text);
   // DNI/NIE format: starts with alphanumeric [A-Z0-9], followed by 7-8 digits,
   // optionally ending with alphanumeric [A-Z0-9]? (e.g. "X1234567A", "12345678Z").
-  const match = norm.match(/\bYO,\s+(.+?),\s*([A-Z0-9]\d{7,8}[A-Z0-9]?)\b/);
+  // Separator between name and DNI can be comma+space or just whitespace.
+  const match = norm.match(/\bYO,\s+(.+?)[,\s]+([A-Z0-9]\d{7,8}[A-Z0-9]?)\b/);
   if (!match) return { name: null, doc: null };
   return { name: match[1].trim(), doc: match[2].trim() };
 }
@@ -179,7 +180,7 @@ function parseName(text) {
  * @returns {string|null}
  */
 function parseIAE(text) {
-  const match = text.match(/\bIAE[:\s]+(\d{1,4}(?:\.\d{1,2})?)\b/);
+  const match = text.match(/\bIAE[:\s]+[A-Z]?(\d{1,4}(?:\.\d{1,2})?)\b/);
   return match ? match[1] : null;
 }
 
@@ -214,6 +215,76 @@ function checkRequiredStrings(text) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
+ * Join line items using position proximity: items that are positionally
+ * adjacent (gap < threshold) are concatenated without a space; items with
+ * a significant gap get a space inserted.  This fixes date fragments
+ * like "07/11" + "/2023" → "07/11/2023".
+ *
+ * @param {object[]} lineItems  Sorted left-to-right by x.
+ * @param {number}   gapTol     Maximum gap (PDF points) to join without space.
+ * @returns {string}
+ */
+function smartJoinLineItems(lineItems, gapTol = 2) {
+  if (lineItems.length === 0) return '';
+  let text = lineItems[0].str;
+  for (let i = 1; i < lineItems.length; i++) {
+    const prev = lineItems[i - 1];
+    const curr = lineItems[i];
+    const prevEnd   = prev.transform[4] + (prev.width || 0);
+    const currStart = curr.transform[4];
+    const gap = currStart - prevEnd;
+    if (gap >= gapTol) text += ' ';
+    text += curr.str;
+  }
+  return text;
+}
+
+/**
+ * Merge PDF.js text items that are positionally adjacent on the same
+ * baseline into single items.  This repairs fragments created by PDF.js
+ * when fonts or encodings change mid-word (e.g. dates split into
+ * "07/11" + "/2023").
+ *
+ * @param {object[]} items     PDF.js TextContent items (with transform, width, height).
+ * @param {number}   yTol      Baseline y tolerance (PDF points).
+ * @param {number}   gapTol    Max horizontal gap to consider "adjacent" (PDF points).
+ * @returns {object[]}         New array of (possibly merged) items.
+ */
+function mergeAdjacentItems(items, yTol = 4, gapTol = 2) {
+  if (items.length <= 1) return items.map(it => ({ ...it }));
+
+  // Sort top→bottom (large y first), then left→right.
+  const sorted = [...items].sort((a, b) => {
+    const dy = b.transform[5] - a.transform[5];
+    if (Math.abs(dy) > yTol) return dy;
+    return a.transform[4] - b.transform[4];
+  });
+
+  const merged = [];
+  let cur = { ...sorted[0], transform: [...sorted[0].transform] };
+
+  for (let i = 1; i < sorted.length; i++) {
+    const item = sorted[i];
+    const sameLine = Math.abs(item.transform[5] - cur.transform[5]) <= yTol;
+    const curEnd   = cur.transform[4] + (cur.width || 0);
+    const gap      = item.transform[4] - curEnd;
+
+    if (sameLine && gap < gapTol) {
+      // Merge into current
+      const newEnd = item.transform[4] + (item.width || 0);
+      cur.str   += item.str;
+      cur.width  = newEnd - cur.transform[4];
+      cur.height = Math.max(cur.height || 0, item.height || 0);
+    } else {
+      merged.push(cur);
+      cur = { ...item, transform: [...item.transform] };
+    }
+  }
+  merged.push(cur);
+  return merged;
+}
+
+/**
  * Extract text and item positions from all pages of a PDF.
  *
  * @param {ArrayBuffer} arrayBuffer  Raw PDF bytes.
@@ -235,9 +306,16 @@ async function extractPDFText(arrayBuffer) {
     const page = await pdf.getPage(pageNum);
     const content = await page.getTextContent({ includeMarkedContent: false });
     // Keep only items that have non-empty string content.
-    const items = content.items.filter(it => it.str && it.str.length > 0);
+    const rawItems = content.items.filter(it => it.str && it.str.length > 0);
+
+    // Merge positionally adjacent items to fix text fragmentation
+    // (dates, split words, etc.).
+    const items = mergeAdjacentItems(rawItems);
     pageItems.push({ pageNum, items });
-    fullText += items.map(it => it.str).join(' ') + '\n';
+
+    // Build fullText using smart position-based joining.
+    const lines = groupItemsByLine(items);
+    fullText += lines.map(line => smartJoinLineItems(line)).join(' ') + '\n';
   }
 
   pdf.destroy();
@@ -399,6 +477,8 @@ async function generateOutputPDF(originalArrayBuffer, pageItems) {
   const RE_DATE_DDMM = /\b\d{2}\/\d{2}\/\d{4}\b/;
   const RE_DATE_ISO  = /\b\d{4}-\d{2}-\d{2}\b/;
 
+  let dateCount = 0;
+
   for (let pi = 0; pi < pages.length; pi++) {
     const pdfPage = pages[pi];
     const { items } = pageItems[pi] || { items: [] };
@@ -406,7 +486,7 @@ async function generateOutputPDF(originalArrayBuffer, pageItems) {
     const lines = groupItemsByLine(items);
 
     for (const line of lines) {
-      const lineText = normalizeSpaces(line.map(it => it.str).join(' '));
+      const lineText = normalizeSpaces(smartJoinLineItems(line));
 
       // ── String replacement 1 ────────────────────────────────────────────
       if (lineText.includes(REQUIRED_STR_1)) {
@@ -437,6 +517,7 @@ async function generateOutputPDF(originalArrayBuffer, pageItems) {
           .replace(/\b\d{4}-\d{2}-\d{2}\b/g,   today);
 
         if (newStr !== item.str) {
+          dateCount++;
           devLog(`Page ${pi + 1}: date "${item.str}" → "${newStr}"`);
           applyTextOverlay(pdfPage, font, [item], newStr);
         }
@@ -444,6 +525,7 @@ async function generateOutputPDF(originalArrayBuffer, pageItems) {
     }
   }
 
+  devLog(`Total dates replaced: ${dateCount}`);
   return pdfDoc.save();
 }
 
@@ -484,6 +566,10 @@ async function processPDFFile(file) {
   devLog(`CNAE   : ${cnae ?? '(not found)'}`);
   devLog(`String 1 found: ${has1}  («${REQUIRED_STR_1}»)`);
   devLog(`String 2 found: ${has2}  («${REQUIRED_STR_2}»)`);
+  // Count dates found in text for diagnostics.
+  const datesDD = (normalizeSpaces(fullText).match(/\b\d{2}\/\d{2}\/\d{4}\b/g) || []);
+  const datesISO = (normalizeSpaces(fullText).match(/\b\d{4}-\d{2}-\d{2}\b/g) || []);
+  devLog(`Dates found: ${datesDD.length} DD/MM/YYYY + ${datesISO.length} ISO = ${datesDD.length + datesISO.length} total`);
   devLog(`Decision: ${has1 && has2 ? '✅ generate PDF' : '❌ manual edit required'}`);
 
   if (!has1 || !has2) {
